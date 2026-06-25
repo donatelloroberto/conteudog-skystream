@@ -41,3 +41,8 @@ In SkyStream: Extensions → Add Source → paste the raw `repo.json` URL.
 
 This build fixes the playback failure by switching stream wrapping to SkyStream's documented `MAGIC_PROXY_v1` format and passing required host headers through `StreamResult.headers`. It also improves resolver coverage for XFileSharing-style hosts such as EarnVids/minochinos and Vinovo, plus broader direct MP4/HLS candidate detection.
 
+
+
+## v3 Playback Fix
+
+This build fixes the StreamTape playback failure shown by SkyStream logs. The previous build returned an obfuscated StreamTape path such as `/get_vixyzadeo?...`, which the local proxy received as a valid stream URL but StreamTape returned as HTTP 404. v3 reconstructs `/get_video?...&stream=1`, sanitizes injected junk in StreamTape paths, avoids returning HTML landing/download pages as streams, and logs per-host resolver counts for debugging.

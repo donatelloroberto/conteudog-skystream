@@ -318,7 +318,10 @@
 
   function isPlayableUrl(url) {
     if (!/^https?:\/\//i.test(url)) return false;
-    return /(\.m3u8(?:\?|$)|\.mp4(?:\?|$)|\.mkv(?:\?|$)|\.webm(?:\?|$)|\/hls\/|\/manifest\/|\/video\/|get_video|videoplayback|stream|download|cdn|\/dl\/|\/d\/)/i.test(url);
+    // Only return URLs that are plausibly direct media endpoints.  Host landing/download
+    // pages such as /d/<id> or /download/<id> are useful to scrape, but must not be
+    // returned to SkyStream's player because MPV will try to play HTML.
+    return /(\.m3u8(?:\?|$)|\.mp4(?:\?|$)|\.mkv(?:\?|$)|\.webm(?:\?|$)|\/hls\/|\/manifest\/|\/video\/|\/file\/|\/media\/|get_video\?|videoplayback|\/stream\/|\/dl\?)/i.test(url);
   }
 
   function streamOrigin(url) {
@@ -332,13 +335,16 @@
 
   function streamHeadersFor(referer, url, extraHeaders) {
     const ref = referer || streamOrigin(url) + "/";
-    return Object.assign({
+    const headers = {
       "User-Agent": UA,
       "Accept": "*/*",
       "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-      "Origin": streamOrigin(ref),
       "Referer": ref
-    }, extraHeaders || {});
+    };
+    // Keep Origin opt-in. Several file/video hosts reject synthetic Origin headers
+    // while a normal browser/video request only needs Referer + UA.
+    if (extraHeaders && extraHeaders.Origin) headers.Origin = extraHeaders.Origin;
+    return Object.assign(headers, extraHeaders || {});
   }
 
   function proxied(url) {
@@ -353,6 +359,7 @@
     return new StreamResult({
       url: finalUrl,
       source: source + (qualityFromUrl(url) ? " " + qualityFromUrl(url) : ""),
+      quality: qualityFromUrl(url) || "Auto",
       headers
     });
   }
@@ -406,23 +413,73 @@
     return dedupeStreams(candidates.filter(isPlayableUrl).map((u) => toStream(u, source || "Voe", embedUrl, { Referer: embedUrl })));
   }
 
+  function normalizeStreamTapeUrl(raw, embedUrl) {
+    if (!raw) return "";
+    let u = decodeEntities(String(raw)).replace(/\\\//g, "/").trim();
+    if (!u) return "";
+    if (u.startsWith("//")) u = "https:" + u;
+    if (u.startsWith("/")) u = new URL(u, embedUrl).toString();
+    if (!/^https?:\/\//i.test(u)) u = absoluteUrl(u, embedUrl);
+
+    // StreamTape currently injects junk characters into the get_video path in
+    // some bot-protection scripts, e.g. get_vixyzadeo.  The valid endpoint is
+    // always /get_video?... .  Returning the obfuscated path causes the exact
+    // 404 seen in the SkyStream log.
+    u = u.replace(/\/get_vi[a-z0-9_\-]{1,12}deo\?/i, "/get_video?");
+    u = u.replace(/\/get_vide?o\?/i, "/get_video?");
+    u = u.replace(/&amp;/g, "&");
+
+    if (/streamtape\.com\/get_video\?/i.test(u) && !/[?&]stream=/.test(u)) {
+      u += (u.includes("?") ? "&" : "?") + "stream=1";
+    }
+    return u;
+  }
+
+  function collectStreamTapeParamUrls(body, embedUrl) {
+    const text = decodeEntities(String(body || "")).replace(/\\\//g, "/");
+    const out = [];
+    const fullRe = /(?:https?:)?\/\/streamtape\.com\/get_vi[a-z0-9_\-]{0,12}deo\?[^"'<>\s]+/ig;
+    let m;
+    while ((m = fullRe.exec(text)) !== null) out.push(normalizeStreamTapeUrl(m[0], embedUrl));
+
+    // Reconstruct from parameters even when the JS splits the path into pieces.
+    const paramRe = /id=([a-z0-9]+)&expires=([0-9]+)&ip=([A-Za-z0-9_\-]+)&token=([A-Za-z0-9_\-]+)/ig;
+    while ((m = paramRe.exec(text)) !== null) {
+      out.push(`https://streamtape.com/get_video?id=${m[1]}&expires=${m[2]}&ip=${m[3]}&token=${m[4]}&stream=1`);
+    }
+    return out;
+  }
+
   async function resolveStreamTape(embedUrl, source) {
     const body = await fetchText(embedUrl, baseUrl() + "/");
     const candidates = [];
+
+    candidates.push(...collectStreamTapeParamUrls(body, embedUrl));
+
     const direct = /["'](https?:\/\/[^"']+(?:\.mp4|\.m3u8)[^"']*)["']/i.exec(body);
     if (direct && direct[1]) candidates.push(direct[1]);
 
-    const concat = /innerHTML\s*=\s*['"]([^'"]+)['"]\s*\+\s*\(?['"]([^'"]+)['"]/i.exec(body);
-    if (concat && concat[1]) candidates.push("https:" + concat[1] + (concat[2] || ""));
-
-    const robot = /id\s*=\s*["']norobotlink["'][^>]*>([\s\S]*?)<\/[^>]+>/i.exec(body);
-    if (robot && robot[1]) {
-      const part = cleanText(robot[1]);
-      if (part.startsWith("//")) candidates.push("https:" + part);
-      else if (part.startsWith("/")) candidates.push(new URL(part, embedUrl).toString());
+    // Classic StreamTape concatenation.  Supports both: 'part1' + 'part2' and
+    // 'part1' + ('part2').  normalizeStreamTapeUrl removes injected junk.
+    const concatPatterns = [
+      /innerHTML\s*=\s*['"]([^'"]+)['"]\s*\+\s*\(?['"]([^'"]+)['"]/i,
+      /document\.getElementById\(['"](?:norobotlink|robotlink|videolink)['"]\)\.innerHTML\s*=\s*['"]([^'"]+)['"]\s*\+\s*\(?['"]([^'"]+)['"]/i
+    ];
+    for (const re of concatPatterns) {
+      const concat = re.exec(body);
+      if (concat && concat[1]) candidates.push((concat[1].startsWith("//") ? "https:" : "") + concat[1] + (concat[2] || ""));
     }
 
-    return dedupeStreams(candidates.map((u) => absoluteUrl(u.replace(/&amp;/g, "&"), embedUrl)).filter(isPlayableUrl).map((u) => toStream(u, source || "StreamTape", embedUrl, { Referer: embedUrl })));
+    const robot = /id\s*=\s*["'](?:norobotlink|robotlink|videolink)["'][^>]*>([\s\S]*?)<\/[^>]+>/i.exec(body);
+    if (robot && robot[1]) candidates.push(cleanText(robot[1]));
+
+    const streams = dedupeStreams(candidates
+      .map((u) => normalizeStreamTapeUrl(u, embedUrl))
+      .filter((u) => /\/get_video\?/i.test(u) || isPlayableUrl(u))
+      .map((u) => toStream(u, source || "StreamTape", embedUrl, { Referer: embedUrl })));
+
+    console.log("ConteudoG StreamTape candidates: " + streams.map((s) => s.source).join(", "));
+    return streams;
   }
 
   function collectPlayableCandidates(text, embedUrl) {
@@ -518,6 +575,7 @@
       for (const p of players) {
         try {
           const resolved = await resolveEmbed(p.embedUrl, p.server);
+          console.log("ConteudoG resolved " + resolved.length + " stream(s) from " + p.server + " -> " + p.embedUrl);
           streams.push(...resolved);
         } catch (e) {
           console.error("Resolver failed for " + p.server + ": " + String(e && e.message || e));
