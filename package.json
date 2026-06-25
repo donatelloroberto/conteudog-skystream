@@ -1,0 +1,13 @@
+{
+  "name": "conteudog-skystream-plugin",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ConteudoG plugin repository for SkyStream Gen 2",
+  "scripts": {
+    "validate": "skystream validate",
+    "test:home": "skystream test -p conteudog -f getHome",
+    "test:load": "skystream test -p conteudog -f load -q https://conteudog.com.br/drafted-3",
+    "test:streams": "skystream test -p conteudog -f loadStreams -q https://conteudog.com.br/drafted-3",
+    "deploy": "skystream deploy -u https://raw.githubusercontent.com/USER_NAME/conteudog-skystream-plugin/main"
+  }
+}

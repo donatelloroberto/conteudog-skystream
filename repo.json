@@ -1,0 +1,9 @@
+{
+  "name": "ConteudoG SkyStream Repository",
+  "packageName": "com.conteudog.skystream",
+  "description": "SkyStream Gen 2 plugin repository for ConteudoG.",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/USER_NAME/conteudog-skystream-plugin/main/dist/plugins.json"
+  ]
+}

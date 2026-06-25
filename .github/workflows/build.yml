@@ -1,0 +1,33 @@
+name: Build SkyStream Repository
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'dist/**'
+      - 'README.md'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+      - name: Install SkyStream CLI
+        run: npm install -g skystream-cli
+      - name: Validate plugin
+        run: skystream validate
+      - name: Build plugin repository
+        run: skystream deploy -u https://raw.githubusercontent.com/${{ github.repository }}/main
+      - name: Commit generated dist
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add repo.json dist README.md
+          git commit -m "chore: build SkyStream plugin artifacts [skip ci]" || echo "No changes"
+          git push
