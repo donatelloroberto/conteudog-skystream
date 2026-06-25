@@ -37,3 +37,7 @@ skystream deploy -u https://raw.githubusercontent.com/USER_NAME/conteudog-skystr
 ```
 
 In SkyStream: Extensions → Add Source → paste the raw `repo.json` URL.
+## v2 Playback Fix
+
+This build fixes the playback failure by switching stream wrapping to SkyStream's documented `MAGIC_PROXY_v1` format and passing required host headers through `StreamResult.headers`. It also improves resolver coverage for XFileSharing-style hosts such as EarnVids/minochinos and Vinovo, plus broader direct MP4/HLS candidate detection.
+

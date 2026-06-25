@@ -1,8 +1,8 @@
 {
   "packageName": "com.conteudog.skystream.conteudog",
   "name": "ConteudoG",
-  "version": 1,
-  "description": "ConteudoG scraper for SkyStream Gen 2. Parses catalogue pages and resolves supported embedded players into app-playable MP4/HLS stream URLs.",
+  "version": 2,
+  "description": "ConteudoG scraper for SkyStream Gen 2. Parses catalogue pages and resolves embedded players into app-playable MP4/HLS streams using SkyStream v1 Magic Proxy headers.",
   "baseUrl": "https://conteudog.com.br",
   "authors": [
     "Generated for Don"

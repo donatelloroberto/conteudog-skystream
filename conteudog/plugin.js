@@ -317,17 +317,39 @@
   }
 
   function isPlayableUrl(url) {
-    return /^https?:\/\//i.test(url) && /(\.m3u8|\.mp4|\.mkv|\.webm|\/hls\/|\/manifest\/|\/video\/|stream|download|cdn)/i.test(url);
+    if (!/^https?:\/\//i.test(url)) return false;
+    return /(\.m3u8(?:\?|$)|\.mp4(?:\?|$)|\.mkv(?:\?|$)|\.webm(?:\?|$)|\/hls\/|\/manifest\/|\/video\/|get_video|videoplayback|stream|download|cdn|\/dl\/|\/d\/)/i.test(url);
   }
 
-  function proxied(url, headers) {
-    const config = { url, headers: headers || headersFor(url), options: { referer: (headers && headers.Referer) || baseUrl() + "/" } };
-    return "MAGIC_PROXY_v2" + btoa(JSON.stringify(config));
+  function streamOrigin(url) {
+    try {
+      const u = new URL(url);
+      return u.protocol + "//" + u.host;
+    } catch (_) {
+      return baseUrl();
+    }
+  }
+
+  function streamHeadersFor(referer, url, extraHeaders) {
+    const ref = referer || streamOrigin(url) + "/";
+    return Object.assign({
+      "User-Agent": UA,
+      "Accept": "*/*",
+      "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Origin": streamOrigin(ref),
+      "Referer": ref
+    }, extraHeaders || {});
+  }
+
+  function proxied(url) {
+    // Use SkyStream's documented/most-compatible proxy format.
+    // The app reads headers from StreamResult.headers and injects them into the local proxy.
+    return "MAGIC_PROXY_v1" + btoa(url);
   }
 
   function toStream(url, source, referer, extraHeaders) {
-    const headers = Object.assign({}, headersFor(referer || url), extraHeaders || {});
-    const finalUrl = proxied(url, headers);
+    const headers = streamHeadersFor(referer || url, url, extraHeaders);
+    const finalUrl = proxied(url);
     return new StreamResult({
       url: finalUrl,
       source: source + (qualityFromUrl(url) ? " " + qualityFromUrl(url) : ""),
@@ -370,8 +392,10 @@
     const candidates = [];
     const patterns = [
       /["']hls["']\s*:\s*["']([^"']+)["']/i,
-      /hls\s*:\s*["']([^"']+)["']/i,
-      /sources\s*=\s*\{[\s\S]*?["']file["']\s*:\s*["']([^"']+)["']/i,
+      /hls\s*[:=]\s*["']([^"']+)["']/i,
+      /file\s*[:=]\s*["']([^"']+(?:\.m3u8|\.mp4)[^"']*)["']/i,
+      /source\s*[:=]\s*["']([^"']+(?:\.m3u8|\.mp4)[^"']*)["']/i,
+      /sources\s*[:=]\s*[\[{][\s\S]*?["']?file["']?\s*:\s*["']([^"']+)["']/i,
       /["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/i,
       /["'](https?:\/\/[^"']+\.mp4[^"']*)["']/i
     ];
@@ -395,21 +419,20 @@
     if (robot && robot[1]) {
       const part = cleanText(robot[1]);
       if (part.startsWith("//")) candidates.push("https:" + part);
-      else if (part.startsWith("/")) candidates.push("https:" + part);
+      else if (part.startsWith("/")) candidates.push(new URL(part, embedUrl).toString());
     }
 
     return dedupeStreams(candidates.map((u) => absoluteUrl(u.replace(/&amp;/g, "&"), embedUrl)).filter(isPlayableUrl).map((u) => toStream(u, source || "StreamTape", embedUrl, { Referer: embedUrl })));
   }
 
-  async function resolveGeneric(embedUrl, source) {
-    const body = await fetchText(embedUrl, baseUrl() + "/");
-    const unpacked = await unpackMaybe(body);
-    const text = body + "\n" + unpacked;
+  function collectPlayableCandidates(text, embedUrl) {
     const candidates = [];
     const regexes = [
-      /(?:file|src|source|video|url)\s*[:=]\s*["']([^"']+(?:\.m3u8|\.mp4|\.mkv|\.webm)[^"']*)["']/ig,
-      /["'](https?:\/\/[^"']+(?:\.m3u8|\.mp4|\.mkv|\.webm)[^"']*)["']/ig,
-      /["'](\/[^"']+(?:\.m3u8|\.mp4|\.mkv|\.webm)[^"']*)["']/ig
+      /(?:file|src|source|video|url|hls)\s*[:=]\s*["']([^"']+(?:\.m3u8|\.mp4|\.mkv|\.webm)[^"']*)["']/ig,
+      /sources\s*[:=]\s*\[[\s\S]{0,800}?file\s*[:=]\s*["']([^"']+)["']/ig,
+      /<source\b[^>]*src\s*=\s*["']([^"']+)["'][^>]*>/ig,
+      /["'](https?:\/\/[^"']+(?:\.m3u8|\.mp4|\.mkv|\.webm|get_video|videoplayback|\/hls\/|\/dl\/|\/d\/)[^"']*)["']/ig,
+      /["'](\/[^"']+(?:\.m3u8|\.mp4|\.mkv|\.webm|get_video|videoplayback|\/hls\/|\/dl\/|\/d\/)[^"']*)["']/ig
     ];
     for (const re of regexes) {
       let m;
@@ -417,7 +440,43 @@
         if (m && m[1]) candidates.push(absoluteUrl(m[1], embedUrl));
       }
     }
-    return dedupeStreams(candidates.filter(isPlayableUrl).map((u) => toStream(u, source || hostLabel(embedUrl), embedUrl, { Referer: embedUrl })));
+    return candidates.filter(isPlayableUrl);
+  }
+
+  async function resolveXFileSharing(embedUrl, source) {
+    const body = await fetchText(embedUrl, baseUrl() + "/");
+    const unpacked = await unpackMaybe(body);
+    const text = body + "\n" + unpacked;
+    let candidates = collectPlayableCandidates(text, embedUrl);
+
+    // Some XFileSharing-style hosts expose the playable URL only after the canonical
+    // /d/<filecode> or /download/<filecode> page is requested. Try those pages, but
+    // only keep real media/CDN URLs extracted from the response.
+    const codeMatch = /\/(?:embed|e|v|d)\/([a-z0-9]+)(?:[/?#]|$)/i.exec(embedUrl) || /\/([a-z0-9]{8,})(?:[/?#]|$)/i.exec(embedUrl);
+    if (codeMatch && codeMatch[1]) {
+      const origin = streamOrigin(embedUrl);
+      const alternates = [
+        origin + "/d/" + codeMatch[1],
+        origin + "/download/" + codeMatch[1],
+        origin + "/" + codeMatch[1]
+      ];
+      for (const alt of alternates) {
+        try {
+          const altBody = await fetchText(alt, embedUrl);
+          const altUnpacked = await unpackMaybe(altBody);
+          candidates.push(...collectPlayableCandidates(altBody + "\n" + altUnpacked, alt));
+        } catch (_) {}
+      }
+    }
+
+    return dedupeStreams(candidates.map((u) => toStream(u, source || hostLabel(embedUrl), embedUrl, { Referer: embedUrl })));
+  }
+
+  async function resolveGeneric(embedUrl, source) {
+    const body = await fetchText(embedUrl, baseUrl() + "/");
+    const unpacked = await unpackMaybe(body);
+    const candidates = collectPlayableCandidates(body + "\n" + unpacked, embedUrl);
+    return dedupeStreams(candidates.map((u) => toStream(u, source || hostLabel(embedUrl), embedUrl, { Referer: embedUrl })));
   }
 
   async function resolveEmbed(embedUrl, server) {
@@ -425,6 +484,9 @@
     if (/mxdrop|mixdrop/.test(h)) return resolveMixDrop(embedUrl, server || "MixDrop");
     if (/voe/.test(h)) return resolveVoe(embedUrl, server || "Voe");
     if (/streamtape/.test(h)) return resolveStreamTape(embedUrl, server || "StreamTape");
+    if (/minochinos|earnvids|vinovo|filemoon|streamwish|vidhide|uqload|dood|lulustream|wolfstream/.test(h)) {
+      return resolveXFileSharing(embedUrl, server || hostLabel(embedUrl));
+    }
     return resolveGeneric(embedUrl, server || hostLabel(embedUrl));
   }
 
