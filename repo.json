@@ -4,6 +4,6 @@
   "description": "SkyStream Gen 2 plugin repository for ConteudoG.",
   "manifestVersion": 1,
   "pluginLists": [
-    "https://raw.githubusercontent.com/donatelloroberto/conteudog-skystream/main/dist/plugins.json"
+    "https://raw.githubusercontent.com/donatelloroberto/conteudog-skystream/refs/heads/main/dist/plugins.json"
   ]
 }
