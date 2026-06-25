@@ -46,3 +46,8 @@ This build fixes the playback failure by switching stream wrapping to SkyStream'
 ## v3 Playback Fix
 
 This build fixes the StreamTape playback failure shown by SkyStream logs. The previous build returned an obfuscated StreamTape path such as `/get_vixyzadeo?...`, which the local proxy received as a valid stream URL but StreamTape returned as HTTP 404. v3 reconstructs `/get_video?...&stream=1`, sanitizes injected junk in StreamTape paths, avoids returning HTML landing/download pages as streams, and logs per-host resolver counts for debugging.
+
+
+## v4 Playback Fix
+
+v4 addresses the last logs where the generated StreamTape URL became `streamtape.comxyza/get_video` and where `/get_video` returned `text/html` instead of media. The resolver now normalizes injected junk in StreamTape host/path/query strings, probes every resolved URL with browser headers and a range request, rejects HTML responses before SkyStream sees them, and skips DNS/handshake-failed hosts instead of returning broken player entries.

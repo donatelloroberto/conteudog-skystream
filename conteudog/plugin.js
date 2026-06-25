@@ -333,6 +333,66 @@
     }
   }
 
+
+  function headerValue(headers, name) {
+    if (!headers) return "";
+    const wanted = String(name || "").toLowerCase();
+    for (const k in headers) {
+      if (String(k).toLowerCase() === wanted) return String(headers[k] || "");
+    }
+    return "";
+  }
+
+  function isProbablyMediaResponse(res, url) {
+    const status = Number((res && (res.status || res.statusCode)) || 0);
+    if (status >= 400 || status === 0) return false;
+    const finalUrl = String((res && res.finalUrl) || url || "");
+    const ct = headerValue(res && res.headers, "content-type").toLowerCase();
+    const bodyStart = String((res && res.body) || "").slice(0, 120).toLowerCase();
+
+    if (/text\/html|application\/xhtml|text\/plain/.test(ct)) return false;
+    if (/^\s*<!doctype html|^\s*<html|<title>|<body/i.test(bodyStart)) return false;
+    if (/video\/.+|application\/(?:octet-stream|vnd\.apple\.mpegurl|x-mpegurl|mpegurl)|audio\/.+/.test(ct)) return true;
+    if (/\.m3u8(?:\?|$)|\.mp4(?:\?|$)|\.mkv(?:\?|$)|\.webm(?:\?|$)|videoplayback|\/hls\/|\/stream\/|\/media\//i.test(finalUrl)) return true;
+    return false;
+  }
+
+  async function verifiedMediaUrl(url, referer, source) {
+    const target = absoluteUrl(url, referer || baseUrl() + "/");
+    if (!isPlayableUrl(target)) return "";
+    try {
+      const probeHeaders = streamHeadersFor(referer || target, target, {
+        "Accept": "*/*",
+        "Referer": referer || streamOrigin(target) + "/"
+      });
+      if (!/\.m3u8(?:\?|$)/i.test(target)) probeHeaders["Range"] = "bytes=0-1";
+      const res = await http_get(target, probeHeaders);
+      if (isProbablyMediaResponse(res, target)) {
+        const finalUrl = String((res && res.finalUrl) || target);
+        console.log("ConteudoG verified " + (source || hostLabel(target)) + " -> " + finalUrl);
+        return finalUrl;
+      }
+      const ct = headerValue(res && res.headers, "content-type");
+      console.log("ConteudoG rejected non-media " + (source || hostLabel(target)) + " status=" + (res && (res.status || res.statusCode)) + " ct=" + ct + " url=" + target);
+    } catch (e) {
+      console.log("ConteudoG probe failed " + (source || hostLabel(target)) + " -> " + target + " :: " + String(e && e.message || e));
+    }
+    return "";
+  }
+
+  async function candidatesToStreams(candidates, source, referer, extraHeaders) {
+    const out = [];
+    const seen = {};
+    for (const raw of candidates || []) {
+      const u = absoluteUrl(raw, referer || baseUrl() + "/");
+      if (!u || seen[u]) continue;
+      seen[u] = true;
+      const checked = await verifiedMediaUrl(u, referer, source);
+      if (checked) out.push(toStream(checked, source || hostLabel(checked), referer || u, extraHeaders));
+    }
+    return dedupeStreams(out);
+  }
+
   function streamHeadersFor(referer, url, extraHeaders) {
     const ref = referer || streamOrigin(url) + "/";
     const headers = {
@@ -389,7 +449,7 @@
       const m = p.exec(unpacked) || p.exec(body);
       if (m && m[1]) candidates.push(absoluteUrl(m[1], embedUrl));
     }
-    return dedupeStreams(candidates.filter(isPlayableUrl).map((u) => toStream(u, source || "MixDrop", embedUrl, { Referer: embedUrl })));
+    return candidatesToStreams(candidates.filter(isPlayableUrl), source || "MixDrop", embedUrl, { Referer: embedUrl });
   }
 
   async function resolveVoe(embedUrl, source) {
@@ -410,44 +470,50 @@
       const m = p.exec(text);
       if (m && m[1]) candidates.push(absoluteUrl(m[1], embedUrl));
     }
-    return dedupeStreams(candidates.filter(isPlayableUrl).map((u) => toStream(u, source || "Voe", embedUrl, { Referer: embedUrl })));
+    return candidatesToStreams(candidates.filter(isPlayableUrl), source || "Voe", embedUrl, { Referer: embedUrl });
   }
 
   function normalizeStreamTapeUrl(raw, embedUrl) {
     if (!raw) return "";
-    let u = decodeEntities(String(raw)).replace(/\\\//g, "/").trim();
+    let u = decodeEntities(String(raw)).replace(/\\//g, "/").replace(/&amp;/g, "&").trim();
     if (!u) return "";
     if (u.startsWith("//")) u = "https:" + u;
     if (u.startsWith("/")) u = new URL(u, embedUrl).toString();
     if (!/^https?:\/\//i.test(u)) u = absoluteUrl(u, embedUrl);
 
-    // StreamTape currently injects junk characters into the get_video path in
-    // some bot-protection scripts, e.g. get_vixyzadeo.  The valid endpoint is
-    // always /get_video?... .  Returning the obfuscated path causes the exact
-    // 404 seen in the SkyStream log.
-    u = u.replace(/\/get_vi[a-z0-9_\-]{1,12}deo\?/i, "/get_video?");
+    // StreamTape injects junk tokens into strings to break scrapers, for example:
+    //   streamtape.comxyza/get_video?...  or  get_vixyzadeo?...  or  ?xyzaid=
+    // Normalize those back to the real host/path/query before probing.
+    u = u.replace(/streamtape\.com[a-z0-9_\-]{2,20}\//i, "streamtape.com/");
+    u = u.replace(/\/get_vi[a-z0-9_\-]{1,24}deo\?/i, "/get_video?");
     u = u.replace(/\/get_vide?o\?/i, "/get_video?");
-    u = u.replace(/&amp;/g, "&");
+    u = u.replace(/([?&])(?:[a-z]{2,16})?(id|expires|ip|token)=/ig, "$1$2=");
+    u = u.replace(/([?&])stream=1(&|$)/i, "$1").replace(/[?&]$/, "");
 
-    if (/streamtape\.com\/get_video\?/i.test(u) && !/[?&]stream=/.test(u)) {
-      u += (u.includes("?") ? "&" : "?") + "stream=1";
+    try {
+      const parsed = new URL(u);
+      if (!/streamtape\.com$/i.test(parsed.hostname)) return "";
+      parsed.hostname = "streamtape.com";
+      return parsed.toString();
+    } catch (_) {
+      return "";
     }
-    return u;
   }
 
   function collectStreamTapeParamUrls(body, embedUrl) {
-    const text = decodeEntities(String(body || "")).replace(/\\\//g, "/");
+    const text = decodeEntities(String(body || "")).replace(/\\//g, "/");
     const out = [];
-    const fullRe = /(?:https?:)?\/\/streamtape\.com\/get_vi[a-z0-9_\-]{0,12}deo\?[^"'<>\s]+/ig;
+    const fullRe = /(?:https?:)?\/\/streamtape\.com[a-z0-9_\-]{0,20}\/get_vi[a-z0-9_\-]{0,24}deo\?[^"'<>\s]+/ig;
     let m;
     while ((m = fullRe.exec(text)) !== null) out.push(normalizeStreamTapeUrl(m[0], embedUrl));
 
-    // Reconstruct from parameters even when the JS splits the path into pieces.
+    // Reconstruct from parameters even when JS inserts junk before parameter names.
+    const clean = text.replace(/([?&])(?:[a-z]{2,16})?(id|expires|ip|token)=/ig, "$1$2=");
     const paramRe = /id=([a-z0-9]+)&expires=([0-9]+)&ip=([A-Za-z0-9_\-]+)&token=([A-Za-z0-9_\-]+)/ig;
-    while ((m = paramRe.exec(text)) !== null) {
-      out.push(`https://streamtape.com/get_video?id=${m[1]}&expires=${m[2]}&ip=${m[3]}&token=${m[4]}&stream=1`);
+    while ((m = paramRe.exec(clean)) !== null) {
+      out.push(`https://streamtape.com/get_video?id=${m[1]}&expires=${m[2]}&ip=${m[3]}&token=${m[4]}`);
     }
-    return out;
+    return out.filter(Boolean);
   }
 
   async function resolveStreamTape(embedUrl, source) {
@@ -459,26 +525,26 @@
     const direct = /["'](https?:\/\/[^"']+(?:\.mp4|\.m3u8)[^"']*)["']/i.exec(body);
     if (direct && direct[1]) candidates.push(direct[1]);
 
-    // Classic StreamTape concatenation.  Supports both: 'part1' + 'part2' and
-    // 'part1' + ('part2').  normalizeStreamTapeUrl removes injected junk.
+    // Classic StreamTape concatenation in #norobotlink / JS: 'part1' + 'part2'.
     const concatPatterns = [
-      /innerHTML\s*=\s*['"]([^'"]+)['"]\s*\+\s*\(?['"]([^'"]+)['"]/i,
-      /document\.getElementById\(['"](?:norobotlink|robotlink|videolink)['"]\)\.innerHTML\s*=\s*['"]([^'"]+)['"]\s*\+\s*\(?['"]([^'"]+)['"]/i
+      /innerHTML\s*=\s*['"]([^'"]+)['"]\s*\+\s*\(?['"]([^'"]+)['"]/ig,
+      /document\.getElementById\(['"](?:norobotlink|robotlink|videolink)['"]\)\.innerHTML\s*=\s*['"]([^'"]+)['"]\s*\+\s*\(?['"]([^'"]+)['"]/ig
     ];
     for (const re of concatPatterns) {
-      const concat = re.exec(body);
-      if (concat && concat[1]) candidates.push((concat[1].startsWith("//") ? "https:" : "") + concat[1] + (concat[2] || ""));
+      let concat;
+      while ((concat = re.exec(body)) !== null) {
+        let candidate = String(concat[1] || "") + String(concat[2] || "");
+        if (candidate.startsWith("//")) candidate = "https:" + candidate;
+        candidates.push(candidate);
+      }
     }
 
     const robot = /id\s*=\s*["'](?:norobotlink|robotlink|videolink)["'][^>]*>([\s\S]*?)<\/[^>]+>/i.exec(body);
     if (robot && robot[1]) candidates.push(cleanText(robot[1]));
 
-    const streams = dedupeStreams(candidates
-      .map((u) => normalizeStreamTapeUrl(u, embedUrl))
-      .filter((u) => /\/get_video\?/i.test(u) || isPlayableUrl(u))
-      .map((u) => toStream(u, source || "StreamTape", embedUrl, { Referer: embedUrl })));
-
-    console.log("ConteudoG StreamTape candidates: " + streams.map((s) => s.source).join(", "));
+    const normalized = candidates.map((u) => normalizeStreamTapeUrl(u, embedUrl)).filter(Boolean);
+    const streams = await candidatesToStreams(normalized, source || "StreamTape", embedUrl, { Referer: embedUrl });
+    console.log("ConteudoG StreamTape verified streams: " + streams.length);
     return streams;
   }
 
@@ -526,14 +592,14 @@
       }
     }
 
-    return dedupeStreams(candidates.map((u) => toStream(u, source || hostLabel(embedUrl), embedUrl, { Referer: embedUrl })));
+    return candidatesToStreams(candidates, source || hostLabel(embedUrl), embedUrl, { Referer: embedUrl });
   }
 
   async function resolveGeneric(embedUrl, source) {
     const body = await fetchText(embedUrl, baseUrl() + "/");
     const unpacked = await unpackMaybe(body);
     const candidates = collectPlayableCandidates(body + "\n" + unpacked, embedUrl);
-    return dedupeStreams(candidates.map((u) => toStream(u, source || hostLabel(embedUrl), embedUrl, { Referer: embedUrl })));
+    return candidatesToStreams(candidates, source || hostLabel(embedUrl), embedUrl, { Referer: embedUrl });
   }
 
   async function resolveEmbed(embedUrl, server) {

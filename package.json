@@ -1,6 +1,6 @@
 {
   "name": "conteudog-skystream-plugin",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "description": "ConteudoG plugin repository for SkyStream Gen 2",
   "scripts": {
