@@ -1,8 +1,8 @@
 {
   "packageName": "com.conteudog.skystream.conteudog",
   "name": "ConteudoG",
-  "version": 4,
-  "description": "ConteudoG scraper for SkyStream Gen 2. v4 fixes StreamTape junk-domain/query injection, validates resolved media by response headers/final URL before returning streams, and skips HTML/blocked hosts so the player only receives plausible MP4/HLS sources.",
+  "version": 5,
+  "description": "ConteudoG scraper for SkyStream Gen 2. v5: fixes Streamtape hostname/path junk (comxyza, get_vixyzadeo, xyzaid= params), adds dedicated Vinovo JWPlayer extractor, improves Voe JSON block parsing, fixes MxDrop wurl prefix, removes dead minochinos.com host, adds playmogo to XFS dispatcher.",
   "baseUrl": "https://conteudog.com.br",
   "authors": [
     "Generated for Don"

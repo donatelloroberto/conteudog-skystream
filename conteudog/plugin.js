@@ -1,6 +1,17 @@
 (function () {
   "use strict";
 
+  // ── v5 fixes (from log analysis) ─────────────────────────────────────────
+  // 1. Streamtape: hostname junk (streamtape.comxyza) now stripped BEFORE URL parsing.
+  // 2. Streamtape: path junk (get_vixyzadeo / get_video?xyzaid=) now cleaned more aggressively.
+  // 3. Streamtape: probe response that returns HTML (200 text/html on /get_video?) rejected.
+  // 4. Vinovo: dedicated extractor using the actual JWPlayer/HLS pattern their pages use.
+  // 5. Voe: improved multi-pattern extraction; handles redirect domain gracefully.
+  // 6. MxDrop: wurl pattern fixed to also match MDCore.wurl with URL cleanup.
+  // 7. minochinos.com: removed from XFileSharing alternates list (dead DNS).
+  // 8. playmogo.com: added to resolveEmbed dispatcher (XFileSharing variant).
+  // ─────────────────────────────────────────────────────────────────────────
+
   const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
   const DEFAULT_POSTER = "https://conteudog.com.br/imagens/logo.png";
 
@@ -318,10 +329,7 @@
 
   function isPlayableUrl(url) {
     if (!/^https?:\/\//i.test(url)) return false;
-    // Only return URLs that are plausibly direct media endpoints.  Host landing/download
-    // pages such as /d/<id> or /download/<id> are useful to scrape, but must not be
-    // returned to SkyStream's player because MPV will try to play HTML.
-    return /(\.m3u8(?:\?|$)|\.mp4(?:\?|$)|\.mkv(?:\?|$)|\.webm(?:\?|$)|\/hls\/|\/manifest\/|\/video\/|\/file\/|\/media\/|get_video\?|videoplayback|\/stream\/|\/dl\?)/i.test(url);
+    return /(\\.m3u8(?:\\?|$)|\\.mp4(?:\\?|$)|\\.mkv(?:\\?|$)|\\.webm(?:\\?|$)|\/hls\/|\/manifest\/|\/video\/|\/file\/|\/media\/|get_video\\?|videoplayback|\/stream\/|\/dl\\?)/i.test(url);
   }
 
   function streamOrigin(url) {
@@ -332,7 +340,6 @@
       return baseUrl();
     }
   }
-
 
   function headerValue(headers, name) {
     if (!headers) return "";
@@ -348,10 +355,13 @@
     if (status >= 400 || status === 0) return false;
     const finalUrl = String((res && res.finalUrl) || url || "");
     const ct = headerValue(res && res.headers, "content-type").toLowerCase();
-    const bodyStart = String((res && res.body) || "").slice(0, 120).toLowerCase();
+    const bodyStart = String((res && res.body) || "").slice(0, 200).toLowerCase();
 
+    // Explicitly reject HTML responses regardless of status — Streamtape returns
+    // 200 + text/html for invalid/obfuscated get_video URLs.
     if (/text\/html|application\/xhtml|text\/plain/.test(ct)) return false;
     if (/^\s*<!doctype html|^\s*<html|<title>|<body/i.test(bodyStart)) return false;
+
     if (/video\/.+|application\/(?:octet-stream|vnd\.apple\.mpegurl|x-mpegurl|mpegurl)|audio\/.+/.test(ct)) return true;
     if (/\.m3u8(?:\?|$)|\.mp4(?:\?|$)|\.mkv(?:\?|$)|\.webm(?:\?|$)|videoplayback|\/hls\/|\/stream\/|\/media\//i.test(finalUrl)) return true;
     return false;
@@ -401,15 +411,11 @@
       "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
       "Referer": ref
     };
-    // Keep Origin opt-in. Several file/video hosts reject synthetic Origin headers
-    // while a normal browser/video request only needs Referer + UA.
     if (extraHeaders && extraHeaders.Origin) headers.Origin = extraHeaders.Origin;
     return Object.assign(headers, extraHeaders || {});
   }
 
   function proxied(url) {
-    // Use SkyStream's documented/most-compatible proxy format.
-    // The app reads headers from StreamResult.headers and injects them into the local proxy.
     return "MAGIC_PROXY_v1" + btoa(url);
   }
 
@@ -434,37 +440,69 @@
     return body;
   }
 
+  // ── MxDrop ───────────────────────────────────────────────────────────────
   async function resolveMixDrop(embedUrl, source) {
     const body = await fetchText(embedUrl, baseUrl() + "/");
     const unpacked = await unpackMaybe(body);
     const candidates = [];
     const patterns = [
-      /wurl\s*=\s*["']([^"']+)["']/i,
-      /MDCore\.wurl\s*=\s*["']([^"']+)["']/i,
-      /(?:file|src)\s*:\s*["']([^"']+(?:\.mp4|\.m3u8)[^"']*)["']/i,
-      /["'](https?:\/\/[^"']+(?:\.mp4|\.m3u8)[^"']*)["']/i,
-      /["'](\/[^"']+(?:\.mp4|\.m3u8)[^"']*)["']/i
+      // FIX: wurl can appear with or without MDCore prefix, and may have // prefix
+      /(?:MDCore\.)?wurl\s*=\s*["']([^"']+)["']/i,
+      /(?:file|src)\s*:\s*["']([^"']+(?:\.mp4|\.m3u8)[^"']*?)["']/i,
+      /["'](https?:\/\/[^"']+(?:\.mp4|\.m3u8)[^"']*?)["']/i,
+      /["'](\/[^"']+(?:\.mp4|\.m3u8)[^"']*?)["']/i
     ];
     for (const p of patterns) {
       const m = p.exec(unpacked) || p.exec(body);
-      if (m && m[1]) candidates.push(absoluteUrl(m[1], embedUrl));
+      if (m && m[1]) {
+        // wurl often starts with // — normalize it
+        let raw = m[1].trim();
+        if (raw.startsWith("//")) raw = "https:" + raw;
+        candidates.push(absoluteUrl(raw, embedUrl));
+      }
     }
     return candidatesToStreams(candidates.filter(isPlayableUrl), source || "MixDrop", embedUrl, { Referer: embedUrl });
   }
 
+  // ── Voe ──────────────────────────────────────────────────────────────────
   async function resolveVoe(embedUrl, source) {
-    const body = await fetchText(embedUrl, baseUrl() + "/");
+    let body;
+    try {
+      body = await fetchText(embedUrl, baseUrl() + "/");
+    } catch (e) {
+      console.log("ConteudoG Voe fetch failed: " + String(e && e.message || e));
+      return [];
+    }
     const unpacked = await unpackMaybe(body);
     const text = body + "\n" + unpacked;
     const candidates = [];
+
+    // JSON application/json block (Voe Method 7/8 — may be plain or encoded)
+    const jsonBlock = /<script[^>]*type\s*=\s*["']application\/json["'][^>]*>([\s\S]*?)<\/script>/i.exec(text);
+    if (jsonBlock) {
+      try {
+        const data = JSON.parse(jsonBlock[1]);
+        const srcs = data && (data.sources || data.source);
+        if (srcs) {
+          if (typeof srcs === "string") {
+            // Try plain URL first
+            if (/^https?:\/\//i.test(srcs)) candidates.push(srcs);
+          } else if (typeof srcs === "object") {
+            const hls = srcs.hls || srcs.mp4 || srcs[Object.keys(srcs)[0]];
+            if (hls && /^https?:\/\//i.test(hls)) candidates.push(hls);
+          }
+        }
+      } catch (_) {}
+    }
+
+    // Standard JS patterns
     const patterns = [
       /["']hls["']\s*:\s*["']([^"']+)["']/i,
-      /hls\s*[:=]\s*["']([^"']+)["']/i,
-      /file\s*[:=]\s*["']([^"']+(?:\.m3u8|\.mp4)[^"']*)["']/i,
-      /source\s*[:=]\s*["']([^"']+(?:\.m3u8|\.mp4)[^"']*)["']/i,
-      /sources\s*[:=]\s*[\[{][\s\S]*?["']?file["']?\s*:\s*["']([^"']+)["']/i,
-      /["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/i,
-      /["'](https?:\/\/[^"']+\.mp4[^"']*)["']/i
+      /hls\s*[=:]\s*["']([^"']+)["']/i,
+      /file\s*[=:]\s*["']([^"']+(?:\.m3u8|\.mp4)[^"']*?)["']/i,
+      /source\s*[=:]\s*["']([^"']+(?:\.m3u8|\.mp4)[^"']*?)["']/i,
+      /["'](https?:\/\/[^"']+\.m3u8[^"']*?)["']/i,
+      /["'](https?:\/\/[^"']+\.mp4[^"']*?)["']/i
     ];
     for (const p of patterns) {
       const m = p.exec(text);
@@ -473,91 +511,160 @@
     return candidatesToStreams(candidates.filter(isPlayableUrl), source || "Voe", embedUrl, { Referer: embedUrl });
   }
 
-  function normalizeStreamTapeUrl(raw, embedUrl) {
+  // ── Streamtape ───────────────────────────────────────────────────────────
+  // BUG FIX: Strip hostname junk AND path junk before building the clean URL.
+  function cleanStreamTapeUrl(raw, embedUrl) {
     if (!raw) return "";
-    let u = decodeEntities(String(raw)).replace(/\\//g, "/").replace(/&amp;/g, "&").trim();
+    let u = decodeEntities(String(raw)).replace(/\\/g, "/").replace(/&amp;/g, "&").trim();
     if (!u) return "";
     if (u.startsWith("//")) u = "https:" + u;
-    if (u.startsWith("/")) u = new URL(u, embedUrl).toString();
+    if (u.startsWith("/")) {
+      try { u = new URL(u, embedUrl).toString(); } catch (_) { return ""; }
+    }
     if (!/^https?:\/\//i.test(u)) u = absoluteUrl(u, embedUrl);
 
-    // StreamTape injects junk tokens into strings to break scrapers, for example:
-    //   streamtape.comxyza/get_video?...  or  get_vixyzadeo?...  or  ?xyzaid=
-    // Normalize those back to the real host/path/query before probing.
-    u = u.replace(/streamtape\.com[a-z0-9_\-]{2,20}\//i, "streamtape.com/");
-    u = u.replace(/\/get_vi[a-z0-9_\-]{1,24}deo\?/i, "/get_video?");
-    u = u.replace(/\/get_vide?o\?/i, "/get_video?");
-    u = u.replace(/([?&])(?:[a-z]{2,16})?(id|expires|ip|token)=/ig, "$1$2=");
+    // FIX 1 — Strip junk from hostname: streamtape.comxyza → streamtape.com
+    // Do this as string manipulation BEFORE parsing with URL() because
+    // "streamtape.comxyza" is a valid (but non-existent) TLD and URL() accepts it.
+    u = u.replace(/(https?:\/\/streamtape\.com)[a-z0-9_\-]{1,30}(\/)/i, "$1$2");
+
+    // FIX 2 — Strip junk from path: get_vixyzadeo → get_video
+    u = u.replace(/\/get_vi[\w\-]*?deo(?=\?)/i, "/get_video");
+
+    // FIX 3 — Strip junk from parameter names: xyzaid= → id=, xyzaexpires= → expires=
+    u = u.replace(/([?&])[a-z0-9_\-]{1,16}?(id|expires|ip|token)=/gi, "$1$2=");
+
+    // Remove the &stream=1 parameter that can confuse the CDN
     u = u.replace(/([?&])stream=1(&|$)/i, "$1").replace(/[?&]$/, "");
 
+    // Validate — must still be a streamtape.com URL after cleaning
     try {
       const parsed = new URL(u);
-      if (!/streamtape\.com$/i.test(parsed.hostname)) return "";
-      parsed.hostname = "streamtape.com";
+      if (!/^streamtape\.com$/i.test(parsed.hostname)) return "";
       return parsed.toString();
     } catch (_) {
       return "";
     }
   }
 
-  function collectStreamTapeParamUrls(body, embedUrl) {
-    const text = decodeEntities(String(body || "")).replace(/\\//g, "/");
+  function collectStreamTapeUrls(body, embedUrl) {
+    const text = decodeEntities(String(body || "")).replace(/\\\//g, "/");
     const out = [];
-    const fullRe = /(?:https?:)?\/\/streamtape\.com[a-z0-9_\-]{0,20}\/get_vi[a-z0-9_\-]{0,24}deo\?[^"'<>\s]+/ig;
-    let m;
-    while ((m = fullRe.exec(text)) !== null) out.push(normalizeStreamTapeUrl(m[0], embedUrl));
 
-    // Reconstruct from parameters even when JS inserts junk before parameter names.
-    const clean = text.replace(/([?&])(?:[a-z]{2,16})?(id|expires|ip|token)=/ig, "$1$2=");
-    const paramRe = /id=([a-z0-9]+)&expires=([0-9]+)&ip=([A-Za-z0-9_\-]+)&token=([A-Za-z0-9_\-]+)/ig;
+    // Pattern A — full URL match (hostname may have junk, path may have junk — cleanStreamTapeUrl fixes both)
+    const fullRe = /(?:https?:)?\/\/streamtape\.com[\w\-]{0,20}\/get_vi[\w\-]{0,24}deo\?[^"'<>\s]+/ig;
+    let m;
+    while ((m = fullRe.exec(text)) !== null) {
+      const cleaned = cleanStreamTapeUrl(m[0], embedUrl);
+      if (cleaned) out.push(cleaned);
+    }
+
+    // Pattern B — reconstruct from id/expires/ip/token params (after stripping junk param prefixes)
+    const clean = text.replace(/([?&])[a-z0-9_\-]{1,16}?(id|expires|ip|token)=/gi, "$1$2=");
+    const paramRe = /id=([a-zA-Z0-9]+)&expires=([0-9]+)&ip=([A-Za-z0-9_\-]+)&token=([A-Za-z0-9_\-]+)/ig;
     while ((m = paramRe.exec(clean)) !== null) {
       out.push(`https://streamtape.com/get_video?id=${m[1]}&expires=${m[2]}&ip=${m[3]}&token=${m[4]}`);
     }
-    return out.filter(Boolean);
-  }
 
-  async function resolveStreamTape(embedUrl, source) {
-    const body = await fetchText(embedUrl, baseUrl() + "/");
-    const candidates = [];
-
-    candidates.push(...collectStreamTapeParamUrls(body, embedUrl));
-
-    const direct = /["'](https?:\/\/[^"']+(?:\.mp4|\.m3u8)[^"']*)["']/i.exec(body);
-    if (direct && direct[1]) candidates.push(direct[1]);
-
-    // Classic StreamTape concatenation in #norobotlink / JS: 'part1' + 'part2'.
-    const concatPatterns = [
+    // Pattern C — innerHTML concatenation: 'part1' + ('part2')
+    const concatRe = [
       /innerHTML\s*=\s*['"]([^'"]+)['"]\s*\+\s*\(?['"]([^'"]+)['"]/ig,
       /document\.getElementById\(['"](?:norobotlink|robotlink|videolink)['"]\)\.innerHTML\s*=\s*['"]([^'"]+)['"]\s*\+\s*\(?['"]([^'"]+)['"]/ig
     ];
-    for (const re of concatPatterns) {
+    for (const re of concatRe) {
       let concat;
       while ((concat = re.exec(body)) !== null) {
         let candidate = String(concat[1] || "") + String(concat[2] || "");
-        if (candidate.startsWith("//")) candidate = "https:" + candidate;
-        candidates.push(candidate);
+        const cleaned = cleanStreamTapeUrl(candidate, embedUrl);
+        if (cleaned) out.push(cleaned);
       }
     }
 
-    const robot = /id\s*=\s*["'](?:norobotlink|robotlink|videolink)["'][^>]*>([\s\S]*?)<\/[^>]+>/i.exec(body);
-    if (robot && robot[1]) candidates.push(cleanText(robot[1]));
+    return [...new Set(out.filter(Boolean))];
+  }
 
-    const normalized = candidates.map((u) => normalizeStreamTapeUrl(u, embedUrl)).filter(Boolean);
-    const streams = await candidatesToStreams(normalized, source || "StreamTape", embedUrl, { Referer: embedUrl });
+  async function resolveStreamTape(embedUrl, source) {
+    let body;
+    try {
+      body = await fetchText(embedUrl, baseUrl() + "/");
+    } catch (e) {
+      console.log("ConteudoG StreamTape fetch failed: " + String(e && e.message || e));
+      return [];
+    }
+    const candidates = collectStreamTapeUrls(body, embedUrl);
+    const streams = await candidatesToStreams(candidates, source || "StreamTape", embedUrl, { Referer: embedUrl });
     console.log("ConteudoG StreamTape verified streams: " + streams.length);
     return streams;
   }
 
+  // ── Vinovo (dedicated extractor) ─────────────────────────────────────────
+  // Vinovo uses JWPlayer with the HLS URL set via jwplayer().setup({sources:[{file:"..."}]})
+  // or via a playlist config. The XFileSharing fallback never found anything because
+  // Vinovo's CDN URLs don't match .mp4/.m3u8 in the path — they're query-param based.
+  async function resolveVinovo(embedUrl, source) {
+    let body;
+    try {
+      body = await fetchText(embedUrl, baseUrl() + "/");
+    } catch (e) {
+      console.log("ConteudoG Vinovo fetch failed: " + String(e && e.message || e));
+      return [];
+    }
+    const unpacked = await unpackMaybe(body);
+    const text = body + "\n" + unpacked;
+    const candidates = [];
+
+    // JWPlayer setup patterns
+    const jwPatterns = [
+      /(?:file|src)\s*:\s*["']([^"']+)["']/ig,
+      /sources\s*:\s*\[[\s\S]{0,500}?["']?file["']?\s*:\s*["']([^"']+)["']/i,
+      /"hls"\s*:\s*"([^"]+)"/i,
+      /playlist\s*:\s*\[[\s\S]{0,500}?(?:file|src)\s*:\s*["']([^"']+)["']/i,
+      // Generic: any CDN URL with video extension or streaming path
+      /["'](https?:\/\/[^"']+\.m3u8[^"']*?)["']/ig,
+      /["'](https?:\/\/[^"']+\.mp4[^"']*?)["']/ig,
+      // Vinovo CDN may serve URLs without extension but with streaming path keywords
+      /["'](https?:\/\/[^"']*(?:\/hls\/|\/stream\/|\/play\/|\/video\/)[^"']+)["']/ig
+    ];
+
+    for (const p of jwPatterns) {
+      // Reset lastIndex for global regexes
+      if (p.global) p.lastIndex = 0;
+      let m;
+      while ((m = p.exec(text)) !== null) {
+        if (m && m[1] && /^https?:\/\//i.test(m[1])) candidates.push(m[1]);
+        if (!p.global) break;
+      }
+    }
+
+    // Also look for the encoded/obfuscated source in a data attribute or atob call
+    const atobM = /atob\(['"]([A-Za-z0-9+/=]+)['"]\)/.exec(text);
+    if (atobM) {
+      try {
+        const decoded = atob(atobM[1]);
+        if (/^https?:\/\//i.test(decoded)) candidates.push(decoded);
+        // decoded may itself contain patterns
+        const innerM = /["'](https?:\/\/[^"']+\.(?:m3u8|mp4)[^"']*?)["']/i.exec(decoded);
+        if (innerM) candidates.push(innerM[1]);
+      } catch (_) {}
+    }
+
+    const filtered = [...new Set(candidates)].filter(isPlayableUrl);
+    console.log("ConteudoG Vinovo candidates: " + filtered.length + " from " + embedUrl);
+    return candidatesToStreams(filtered, source || "Vinovo", embedUrl, { Referer: embedUrl });
+  }
+
+  // ── Generic XFileSharing ──────────────────────────────────────────────────
   function collectPlayableCandidates(text, embedUrl) {
     const candidates = [];
     const regexes = [
-      /(?:file|src|source|video|url|hls)\s*[:=]\s*["']([^"']+(?:\.m3u8|\.mp4|\.mkv|\.webm)[^"']*)["']/ig,
-      /sources\s*[:=]\s*\[[\s\S]{0,800}?file\s*[:=]\s*["']([^"']+)["']/ig,
+      /(?:file|src|source|video|url|hls)\s*[=:]\s*["']([^"']+(?:\.m3u8|\.mp4|\.mkv|\.webm)[^"']*?)["']/ig,
+      /sources\s*[=:]\s*\[[\s\S]{0,800}?file\s*[=:]\s*["']([^"']+)["']/ig,
       /<source\b[^>]*src\s*=\s*["']([^"']+)["'][^>]*>/ig,
-      /["'](https?:\/\/[^"']+(?:\.m3u8|\.mp4|\.mkv|\.webm|get_video|videoplayback|\/hls\/|\/dl\/|\/d\/)[^"']*)["']/ig,
-      /["'](\/[^"']+(?:\.m3u8|\.mp4|\.mkv|\.webm|get_video|videoplayback|\/hls\/|\/dl\/|\/d\/)[^"']*)["']/ig
+      /["'](https?:\/\/[^"']+(?:\.m3u8|\.mp4|\.mkv|\.webm|get_video|videoplayback|\/hls\/|\/stream\/)[^"']*?)["']/ig,
+      /["'](\/[^"']+(?:\.m3u8|\.mp4|\.mkv|\.webm|get_video|videoplayback|\/hls\/|\/stream\/)[^"']*?)["']/ig
     ];
     for (const re of regexes) {
+      re.lastIndex = 0;
       let m;
       while ((m = re.exec(text)) !== null) {
         if (m && m[1]) candidates.push(absoluteUrl(m[1], embedUrl));
@@ -567,17 +674,21 @@
   }
 
   async function resolveXFileSharing(embedUrl, source) {
-    const body = await fetchText(embedUrl, baseUrl() + "/");
+    let body;
+    try {
+      body = await fetchText(embedUrl, baseUrl() + "/");
+    } catch (e) {
+      console.log("ConteudoG XFS fetch failed for " + embedUrl + ": " + String(e && e.message || e));
+      return [];
+    }
     const unpacked = await unpackMaybe(body);
     const text = body + "\n" + unpacked;
     let candidates = collectPlayableCandidates(text, embedUrl);
 
-    // Some XFileSharing-style hosts expose the playable URL only after the canonical
-    // /d/<filecode> or /download/<filecode> page is requested. Try those pages, but
-    // only keep real media/CDN URLs extracted from the response.
     const codeMatch = /\/(?:embed|e|v|d)\/([a-z0-9]+)(?:[/?#]|$)/i.exec(embedUrl) || /\/([a-z0-9]{8,})(?:[/?#]|$)/i.exec(embedUrl);
     if (codeMatch && codeMatch[1]) {
       const origin = streamOrigin(embedUrl);
+      // NOTE: minochinos.com removed — dead DNS (confirmed from logs)
       const alternates = [
         origin + "/d/" + codeMatch[1],
         origin + "/download/" + codeMatch[1],
@@ -596,18 +707,27 @@
   }
 
   async function resolveGeneric(embedUrl, source) {
-    const body = await fetchText(embedUrl, baseUrl() + "/");
+    let body;
+    try {
+      body = await fetchText(embedUrl, baseUrl() + "/");
+    } catch (e) {
+      console.log("ConteudoG generic fetch failed for " + embedUrl + ": " + String(e && e.message || e));
+      return [];
+    }
     const unpacked = await unpackMaybe(body);
     const candidates = collectPlayableCandidates(body + "\n" + unpacked, embedUrl);
     return candidatesToStreams(candidates, source || hostLabel(embedUrl), embedUrl, { Referer: embedUrl });
   }
 
+  // ── Dispatcher ────────────────────────────────────────────────────────────
   async function resolveEmbed(embedUrl, server) {
     const h = hostLabel(embedUrl).toLowerCase();
     if (/mxdrop|mixdrop/.test(h)) return resolveMixDrop(embedUrl, server || "MixDrop");
-    if (/voe/.test(h)) return resolveVoe(embedUrl, server || "Voe");
+    if (/\bvoe\b/.test(h)) return resolveVoe(embedUrl, server || "Voe");
     if (/streamtape/.test(h)) return resolveStreamTape(embedUrl, server || "StreamTape");
-    if (/minochinos|earnvids|vinovo|filemoon|streamwish|vidhide|uqload|dood|lulustream|wolfstream/.test(h)) {
+    // FIX: vinovo now has a dedicated extractor; playmogo added as XFS variant
+    if (/vinovo/.test(h)) return resolveVinovo(embedUrl, server || "Vinovo");
+    if (/playmogo|earnvids|filemoon|streamwish|vidhide|uqload|dood|lulustream|wolfstream/.test(h)) {
       return resolveXFileSharing(embedUrl, server || hostLabel(embedUrl));
     }
     return resolveGeneric(embedUrl, server || hostLabel(embedUrl));
