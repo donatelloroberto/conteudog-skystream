@@ -1,27 +1,24 @@
-[
-  {
-    "packageName": "com.conteudog.skystream.conteudog",
-    "name": "ConteudoG",
-    "version": 1,
-    "description": "ConteudoG scraper for SkyStream Gen 2. Parses catalogue pages and resolves supported embedded players into app-playable MP4/HLS stream URLs.",
-    "baseUrl": "https://conteudog.com.br",
-    "authors": [
-      "Generated for Don"
-    ],
-    "languages": [
-      "pt-BR"
-    ],
-    "categories": [
-      "Adult",
-      "Movies",
-      "Scenes"
-    ],
-    "domains": [
-      {
-        "name": "conteudog.com.br",
-        "url": "https://conteudog.com.br"
-      }
-    ],
-    "url": "https://raw.githubusercontent.com/donatelloroberto/conteudog-skystream/main/dist/com.conteudog.skystream.conteudog.sky"
-  }
-]
+{
+  "packageName": "com.conteudog.skystream.conteudog",
+  "name": "ConteudoG",
+  "version": 5,
+  "description": "ConteudoG scraper for SkyStream Gen 2. v5: fixes Streamtape hostname/path junk (comxyza, get_vixyzadeo, xyzaid= params), adds dedicated Vinovo JWPlayer extractor, improves Voe JSON block parsing, fixes MxDrop wurl prefix, removes dead minochinos.com host, adds playmogo to XFS dispatcher.",
+  "baseUrl": "https://conteudog.com.br",
+  "authors": [
+    "Generated for Don"
+  ],
+  "languages": [
+    "pt-BR"
+  ],
+  "categories": [
+    "Adult",
+    "Movies",
+    "Scenes"
+  ],
+  "domains": [
+    {
+      "name": "conteudog.com.br",
+      "url": "https://conteudog.com.br"
+    }
+  ]
+}
